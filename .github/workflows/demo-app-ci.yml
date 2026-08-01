@@ -1,0 +1,108 @@
+name: CI - Build, Scan & Notify GitOps Repo
+
+# Trunk-based: this repo has ONE long-lived branch (main). Feature work
+# happens on short-lived branches, merged into main via PR + review. Every
+# merge to main = a new immutable image. Environment promotion (dev/test/
+# prod) is NOT this repo's concern at all — that lives entirely in the
+# gke-argocd-gitops repo's own develop/test/main branches and promote.yml.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read   # this repo's own contents — no write needed here at all
+
+env:
+  PROJECT_ID: gke-prod-demo-001
+  REGION: asia-south1
+  REPO: demo-app
+  GITOPS_REPO: linuxshakil/gke-argocd-gitops
+  GITOPS_BRANCH: develop
+
+jobs:
+  build-scan-notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build image
+        id: build
+        run: |
+          IMAGE_TAG="sha-${GITHUB_SHA::7}"
+          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.REPO }}:${IMAGE_TAG}"
+          docker build -t "$IMAGE" .
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.build.outputs.image }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Push image (only reached if the scan passed)
+        run: docker push ${{ steps.build.outputs.image }}
+
+      # This is the ONLY part that's genuinely new compared to the old
+      # single-repo setup: instead of bumping a file in THIS repo, we check
+      # out the SEPARATE gitops repo and bump its file there. That needs a
+      # token with write access to that OTHER repo — WIF/GITHUB_TOKEN from
+      # this repo can't write to a different repo.
+      #
+      # Deliberately NOT a personal access token (PAT) here — fine-grained
+      # PATs MUST have an expiry (GitHub caps it at 1 year), so a PAT would
+      # silently break this pipeline on some future date nobody remembers
+      # to watch for. A GitHub App's installation token is minted FRESH on
+      # every single run (valid ~1 hour, then discarded) from a private key
+      # that itself never expires — nothing to rotate on a schedule, ever.
+      - name: Generate a short-lived token for the gitops repo
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.GITOPS_APP_ID }}
+          private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+          owner: linuxshakil
+          repositories: gke-argocd-gitops
+
+      - name: Check out the gitops repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          ref: ${{ env.GITOPS_BRANCH }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: gitops-repo
+
+      - name: Bump values-dev.yaml in the gitops repo
+        run: |
+          sed -i "s/tag: .*/tag: \"${{ steps.build.outputs.image_tag }}\"/" \
+            gitops-repo/apps/demo-app/values-dev.yaml
+
+      - name: Commit and push to the gitops repo
+        working-directory: gitops-repo
+        run: |
+          git config user.name "demo-app-ci[bot]"
+          git config user.email "demo-app-ci-bot@users.noreply.github.com"
+          git add apps/demo-app/values-dev.yaml
+          git commit -m "ci(demo-app): bump dev image to ${{ steps.build.outputs.image_tag }} (source: ${{ github.repository }}@${{ github.sha }})"
+          git push origin ${{ env.GITOPS_BRANCH }}
+
+      # No `kubectl`, no `helm`, no cluster credentials anywhere in this
+      # workflow. This repo's CI identity (demo-app-ci-sa) only ever holds
+      # roles/artifactregistry.writer — it cannot touch the cluster even if
+      # it wanted to. Argo CD, watching the gitops repo, does the rest.
