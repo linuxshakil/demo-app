@@ -93,7 +93,19 @@ jobs:
           sed -i "s/tag: .*/tag: \"${{ steps.build.outputs.image_tag }}\"/" \
             gitops-repo/apps/demo-app/values-dev.yaml
 
+      - name: Check for an actual diff
+        id: diff
+        working-directory: gitops-repo
+        run: |
+          if git diff --quiet -- apps/demo-app/values-dev.yaml; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::values-dev.yaml already has this tag — nothing to commit."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Commit and push to the gitops repo
+        if: steps.diff.outputs.changed == 'true'
         working-directory: gitops-repo
         run: |
           git config user.name "demo-app-ci[bot]"
